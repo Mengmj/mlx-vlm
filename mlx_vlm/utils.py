@@ -41,6 +41,7 @@ ACTIVATION_QUANTIZATION_MODES = {"nvfp4", "mxfp8"}
 
 # Constants
 MODEL_REMAPPING = {
+    "muse_spark_open": "muse_spark",
     "nemotron_h_puzzle": "nemotron_h",
     "moondream1": "moondream2",
     "llava_qwen2": "fastvlm",  # Apple's FastVLM, note it's different to the one below
@@ -208,6 +209,8 @@ def get_model_type(config: dict) -> Optional[str]:
     dflash_config = config.get("dflash_config")
     if "Lfm2BidirectionalForMaskedLM" in architectures:
         model_type = "lfm2_encoder"
+    elif "RadioMBartPrefixForCausalLM" in architectures:
+        model_type = "nemotron_parse_v3_5"
     elif "BoundaryExtractor" in architectures:
         model_type = "gliner2_5"
     elif "DFlash2DraftModel" in architectures:
@@ -518,6 +521,13 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     from .models.deepseek_v4.language import make_quantization_config
 
                     quantization = make_quantization_config(model)
+            elif (
+                quant_method == "modelopt"
+                and quantization_config.get("quant_algo") == "NVFP4"
+            ):
+                # Some ModelOpt MoE exports use fused, underscore-delimited
+                # tensor names handled by the model's sanitizer below.
+                quantization = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
             elif (
                 quant_method == "modelopt"
                 and quantization_config.get("quant_algo") == "MXFP8"

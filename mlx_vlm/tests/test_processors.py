@@ -26,8 +26,10 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from PIL import Image
-from tokenizers import Tokenizer
+from tokenizers import AddedToken, Tokenizer
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import WordLevel
+from tokenizers.normalizers import NFKC
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import AutoProcessor, PreTrainedTokenizerBase, PreTrainedTokenizerFast
 
@@ -50,6 +52,9 @@ from mlx_vlm.tokenizer_utils import (
     _is_spm_decoder,
     _is_spm_decoder_no_space,
     _match,
+    _ServerTokenStreamer,
+    load_tokenizer,
+    make_streaming_detokenizer,
 )
 from mlx_vlm.tools import (
     SPECS,
@@ -206,6 +211,215 @@ def test_initialization():
 
     assert detokenizer._byte_decoder is not None
     assert detokenizer.text == ""
+
+
+@pytest.mark.parametrize("server_stream", [False, True], ids=["cli", "server"])
+@pytest.mark.parametrize("trim_space", [False, True], ids=["keep-space", "trim-space"])
+@pytest.mark.parametrize(
+    "pieces, expected_segments, final_segment",
+    [
+        (["Ġhello", "Ġworld"], [" hello", " world"], ""),
+        (["hello", "\n\n", "world"], ["hello", "\n\n", "world"], ""),
+        (["高", "ა", "🙂"], ["高", "ა", "🙂"], ""),
+        (["Ġé\n高", "Ġdone"], ["Ġé\n高", " done"], ""),
+        ([" hello", "\t", "world"], [" hello", "\t", "world"], ""),
+        (["Ã", "©", "\n\n", "高"], ["", "é", "\n\n", "高"], ""),
+        (["Ã", "高", "©", "Ġdone"], ["", "\ufffd高", "\ufffd", " done"], ""),
+        (["Ã", "高", "©"], ["", "\ufffd高", "\ufffd"], ""),
+        (["hello", "Ã"], ["hello", ""], "\ufffd"),
+        (["ðŁ", "ĻĤ"], ["", "🙂"], ""),
+        (["ðŁ"], [""], "\ufffd"),
+        (["\ufffd"], ["\ufffd"], ""),
+        (["Ġ", "Ġ", "hello"], [" ", " ", "hello"], ""),
+    ],
+    ids=[
+        "byte-alphabet",
+        "literal-newlines",
+        "literal-unicode",
+        "whole-token-fallback",
+        "literal-whitespace",
+        "split-utf8",
+        "interrupted-utf8",
+        "invalid-utf8-at-end",
+        "incomplete-utf8-at-end",
+        "split-emoji",
+        "incomplete-emoji-at-end",
+        "literal-replacement-character",
+        "trim-only-first-space",
+    ],
+)
+def test_bpe_streaming_matches_native_bytelevel(
+    tmp_path, pieces, expected_segments, final_segment, trim_space, server_stream
+):
+    backend = Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    backend.decoder = ByteLevelDecoder()
+    backend.add_tokens(list(dict.fromkeys(pieces)))
+    backend.save(str(tmp_path / "tokenizer.json"))
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, clean_up_tokenization_spaces=False
+    )
+    tokens = [backend.token_to_id(piece) for piece in pieces]
+    assert tokenizer.decode(tokens) == "".join(expected_segments) + final_segment
+
+    factory = load_tokenizer(tmp_path, return_tokenizer=False)
+    assert factory is BPEStreamingDetokenizer
+    detokenizer = factory(tokenizer, trim_space=trim_space)
+    expected_segments = expected_segments.copy()
+    if trim_space:
+        for i, segment in enumerate(expected_segments):
+            if segment:
+                expected_segments[i] = segment.removeprefix(" ")
+                break
+    expected = "".join(expected_segments) + final_segment
+
+    # Resetting an existing detokenizer must preserve its normalized token map.
+    for _ in range(2):
+        detokenizer.reset()
+        segments = []
+        if server_stream:
+            streamer = _ServerTokenStreamer(tokenizer, detokenizer)
+            for token in tokens:
+                segments.append(streamer.advance(token, finish_reason=None))
+            assert segments == expected_segments
+            assert streamer.finalize() == final_segment
+            assert streamer.finalize() == ""
+        else:
+            for token in tokens:
+                detokenizer.add_token(token)
+                segments.append(detokenizer.last_segment)
+                assert detokenizer.last_segment == ""
+            assert segments == expected_segments
+            detokenizer.finalize()
+            assert detokenizer.last_segment == final_segment
+            detokenizer.finalize()
+            assert detokenizer.last_segment == ""
+            assert detokenizer.text == expected
+        assert "".join(segments) + final_segment == expected
+
+
+@pytest.mark.parametrize("server_stream", [False, True], ids=["cli", "server"])
+@pytest.mark.parametrize("normalized", [False, True], ids=["literal", "normalized"])
+@pytest.mark.parametrize(
+    "piece, canonical",
+    [("ŉ", "ʼn"), ("ำ", "ํา"), ("ﭏ", "אל"), ("ﬃ", "ffi"), ("ͺ", " ͅ")],
+    ids=["apostrophe-n", "thai", "hebrew", "ligature", "leading-space"],
+)
+def test_bpe_streaming_uses_canonical_added_tokens(
+    tmp_path, piece, canonical, normalized, server_stream
+):
+    backend = Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    backend.normalizer = NFKC()
+    backend.decoder = ByteLevelDecoder()
+    backend.add_tokens([AddedToken(piece, normalized=normalized)])
+    backend.save(str(tmp_path / "tokenizer.json"))
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, clean_up_tokenization_spaces=False
+    )
+    token = tokenizer.vocab[piece]
+    expected = tokenizer.convert_ids_to_tokens(token)
+    assert expected in {piece, canonical}
+    assert tokenizer.decode([token]) == expected
+
+    detokenizer = load_tokenizer(tmp_path, return_tokenizer=False)(tokenizer)
+    if server_stream:
+        streamer = _ServerTokenStreamer(tokenizer, detokenizer)
+        assert streamer.advance(token, finish_reason=None) == expected
+        assert streamer.finalize() == ""
+    else:
+        detokenizer.add_token(token)
+        assert detokenizer.last_segment == expected
+        detokenizer.finalize()
+        assert detokenizer.last_segment == ""
+        assert detokenizer.text == expected
+
+
+@pytest.mark.parametrize("server_stream", [False, True], ids=["cli", "server"])
+@pytest.mark.parametrize("stride", [1, 2], ids=["dense-vocab", "sparse-vocab"])
+@pytest.mark.parametrize(
+    "pieces, expected",
+    [
+        ([None], ""),
+        ([None, "Ġhello"], "hello"),
+        (["Ã", None, "©"], "é"),
+        (["Ã", None], "\ufffd"),
+        (["z", None, "z"], "zz"),
+    ],
+    ids=["only-unmapped", "leading-space", "split-utf8", "truncated-utf8", "ascii"],
+)
+def test_bpe_streaming_skips_unmapped_ids(stride, pieces, expected, server_stream):
+    vocab = {piece: i * stride for i, piece in enumerate(["Ã", "©", "Ġhello", "z"])}
+    backend = Tokenizer(WordLevel(vocab))
+    backend.decoder = ByteLevelDecoder()
+    tokenizer = NS(
+        vocab=backend.get_vocab(),
+        convert_ids_to_tokens=backend.id_to_token,
+        decode=backend.decode,
+    )
+    unmapped = [
+        i for i in range(max(vocab.values()) + 2) if backend.id_to_token(i) is None
+    ]
+    unmapped.append(2**32 - 1)
+    tokens = [
+        token
+        for piece in pieces
+        for token in (unmapped if piece is None else [vocab[piece]])
+    ]
+    assert tokenizer.decode(tokens).removeprefix(" ") == expected
+
+    detokenizer = BPEStreamingDetokenizer(tokenizer, trim_space=True)
+    streamer = _ServerTokenStreamer(tokenizer, detokenizer) if server_stream else None
+    segments = []
+    for token in tokens:
+        if server_stream:
+            segment = streamer.advance(token, finish_reason=None)
+        else:
+            detokenizer.add_token(token)
+            segment = detokenizer.last_segment
+        if token in unmapped:
+            assert segment == ""
+        segments.append(segment)
+    if server_stream:
+        segments.append(streamer.finalize())
+    else:
+        detokenizer.finalize()
+        segments.append(detokenizer.last_segment)
+        assert detokenizer.text == expected
+    assert "".join(segments) == expected
+
+
+@pytest.mark.parametrize("server_stream", [False, True], ids=["cli", "server"])
+def test_bpe_streaming_empty_vocab(server_stream):
+    backend = Tokenizer(WordLevel({}))
+    tokenizer = NS(vocab=backend.get_vocab(), decode=backend.decode)
+    assert tokenizer.decode([0]) == ""
+    detokenizer = BPEStreamingDetokenizer(tokenizer)
+    if server_stream:
+        streamer = _ServerTokenStreamer(tokenizer, detokenizer)
+        assert streamer.advance(0, finish_reason=None) == ""
+        assert streamer.finalize() == ""
+    else:
+        detokenizer.add_token(0)
+        detokenizer.finalize()
+        assert detokenizer.text == ""
+
+
+def test_bpe_streaming_copies_isolate_partial_utf8_and_skip_tokens():
+    source = BPEStreamingDetokenizer(
+        MockTokenizer({"Ã": 0, "©": 1, "高": 2, "<skip>": 3})
+    )
+    source.add_token(0)
+    processor = NS(detokenizer=source)
+    left = make_streaming_detokenizer(processor)
+    right = make_streaming_detokenizer(processor)
+    left.add_token(0)
+    assert left.last_segment == ""
+    right.add_token(2)
+    assert right.last_segment == "高"
+    left.add_token(3, skip_special_token_ids=[3])
+    left.add_token(1)
+    assert left.last_segment == "é"
+    source.add_token(1)
+    assert source.last_segment == "é"
 
 
 @pytest.mark.parametrize("factory", [None, SPMStreamingDetokenizer])
@@ -638,6 +852,73 @@ def test_auto_processor_routes_to_custom_loader(
         loader.assert_called_once_with(tmp_path, trust_remote_code=True)
 
 
+def test_flint_tokenizer_prompt_and_stop_tokens(tmp_path):
+    importlib.import_module("mlx_vlm.models.flint")
+    raw = Tokenizer(
+        WordLevel(
+            {
+                "[UNK]": 0,
+                "hello": 1,
+                "<|end_of_text|>": 2,
+                "<|user|>": 3,
+                "<|assistant|>": 4,
+            },
+            unk_token="[UNK]",
+        )
+    )
+    raw.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=raw,
+        unk_token="[UNK]",
+        eos_token="<|end_of_text|>",
+        additional_special_tokens=["<|user|>", "<|assistant|>"],
+    )
+    tokenizer.chat_template = (
+        "{% for m in messages %}<|{{ m.role }}|>"
+        "{% if m.reasoning_content %}<think>{{ m.reasoning_content }}</think>{% endif %}"
+        "{{ m.content }}{% for tc in m.tool_calls %}<tool_call>{{ tc.function.name }}"
+        "{% for k, v in tc.function.arguments.items() %}"
+        "<arg_key>{{ k }}</arg_key><arg_value>{{ v }}</arg_value>{% endfor %}"
+        "</tool_call>{% endfor %}{% endfor %}"
+        "{% if add_generation_prompt %}<|assistant|>{% endif %}"
+    )
+    tokenizer.save_pretrained(tmp_path)
+    _write_configs(
+        tmp_path,
+        config={
+            "model_type": "flint",
+            "auto_map": {"AutoConfig": "must_not_execute.FlintConfig"},
+        },
+    )
+    processor = load_processor(tmp_path, eos_token_ids=[2, 4], trust_remote_code=False)
+    assert isinstance(processor, PreTrainedTokenizerBase)
+    assert processor.backend_tokenizer.to_str() == tokenizer.backend_tokenizer.to_str()
+    prompt = apply_chat_template(processor, {"model_type": "flint"}, "hello")
+    assert prompt == "<|user|>hello<|assistant|>"
+    assert processor.encode(prompt) == [3, 1, 4]
+    assert processor.stopping_criteria(2)
+    assert processor.stopping_criteria(4)
+    assert not processor.stopping_criteria(1)
+    assert _infer_tool_parser_from_processor(processor) == "glm47"
+    previous_answer = dict(
+        role="assistant", content="hello", reasoning_content="Remember this."
+    )
+    previous_call = dict(
+        role="assistant",
+        content=None,
+        reasoning_content="Look it up.",
+        tool_calls=[dict(function=dict(name="lookup", arguments='{"query": "hello"}'))],
+    )
+    for messages in (previous_call, [previous_answer, previous_call]):
+        original = deepcopy(messages)
+        rendered = apply_chat_template(processor, {"model_type": "flint"}, messages)
+        assert "<think>Look it up.</think><tool_call>lookup" in rendered
+        assert "<arg_key>query</arg_key><arg_value>hello</arg_value>" in rendered
+        if isinstance(messages, list):
+            assert "<think>Remember this.</think>hello" in rendered
+        assert messages == original
+
+
 def test_qwen3_5_moe_text_stale_vl_processor_loads_tokenizer(tmp_path):
     from transformers import Qwen2Tokenizer
 
@@ -774,6 +1055,19 @@ def test_gemma3n_batches_images_and_audio():
 
     assert result["input_ids"].shape[0] == 2
     assert processor.tokenizer.last_kwargs["padding"] is True
+
+
+def test_nemotron_parse_packed_page_geometry_and_patch_order():
+    image = Image.fromarray(np.arange(17 * 65 * 3, dtype=np.uint8).reshape(17, 65, 3))
+    inputs = m.nemotron_parse_v3_5.ImageProcessor()(image)
+    assert inputs["image_sizes"].tolist() == [[32, 128]]
+    assert inputs["content_sizes"].tolist() == [[17, 65]]
+    assert inputs["pixel_values"].shape == (16, 768)
+    expected = (
+        np.asarray(image).transpose(2, 0, 1).astype(np.float32) / 255
+        - np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)[:, None, None]
+    ) / np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)[:, None, None]
+    equal(inputs["pixel_values"][0], expected[:, :16, :16].reshape(-1))
 
 
 def test_unlimited_ocr_default_chat_template_omits_trailing_space():
